@@ -5,14 +5,15 @@ const cors = require('cors');
 const bcrypt = require('bcrypt');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { body, validationResult } = require('express-validator');
+const { body, param, validationResult } = require('express-validator');
 
 const app = express();
 const port = process.env.PORT || 8000;
 
 // Middleware de sécurité
-app.use(helmet()); // Headers de sécurité HTTP
-app.use(express.json()); // Remplacer express.text()
+app.use(helmet());
+app.use(express.json()); // Pour les requêtes JSON
+app.use(express.text()); // Pour compatibilité avec l'ancien code
 app.use(cors({
   origin: process.env.ALLOWED_ORIGIN || 'http://localhost:3000',
   credentials: true
@@ -20,12 +21,12 @@ app.use(cors({
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // max 100 requêtes par IP
+  windowMs: 15 * 60 * 1000,
+  max: 100
 });
 app.use(limiter);
 
-// Connexion DB sécurisée
+// Connexion DB
 const db = new sqlite3.Database('./database.db', (err) => {
   if (err) {
     console.error('DB connection error:', err.message);
@@ -61,7 +62,6 @@ async function insertRandomUsers() {
       const fullName = `${u.name.first} ${u.name.last}`;
       const hashedPassword = await bcrypt.hash(u.login.password, 10);
       
-      // Requête préparée sécurisée
       db.run(
         'INSERT INTO users (name, password) VALUES (?, ?)',
         [fullName, hashedPassword],
@@ -77,8 +77,9 @@ async function insertRandomUsers() {
   }
 }
 
-// Routes sécurisées
+// ============= ROUTES =============
 
+// Peupler la base
 app.get('/populate', async (req, res) => {
   try {
     await insertRandomUsers();
@@ -88,9 +89,7 @@ app.get('/populate', async (req, res) => {
   }
 });
 
-// SUPPRIMER cette route dangereuse
-// app.post('/query', ...) 
-
+// Lister tous les utilisateurs (seulement id et name)
 app.get('/users', (req, res) => {
   db.all('SELECT id, name, created_at FROM users', [], (err, rows) => {
     if (err) {
@@ -101,12 +100,48 @@ app.get('/users', (req, res) => {
   });
 });
 
-// Route sécurisée pour obtenir un utilisateur par ID
-app.get('/user/:id', (req, res) => {
+// Obtenir un utilisateur par ID (route sécurisée via GET)
+app.get('/user/:id', [
+  param('id').isInt().withMessage('Invalid user ID')
+], (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
   const userId = parseInt(req.params.id);
   
-  if (isNaN(userId)) {
-    return res.status(400).json({ error: 'Invalid user ID' });
+  db.get(
+    'SELECT id, name, created_at FROM users WHERE id = ?',
+    [userId],
+    (err, row) => {
+      if (err) {
+        console.error('Query error:', err.message);
+        return res.status(500).json({ error: 'Database error' });
+      }
+      if (!row) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      // Retourner dans un tableau pour compatibilité avec App.js
+      res.json([row]);
+    }
+  );
+});
+
+// Route POST compatible avec l'ancien App.js (mais sécurisée)
+app.post('/user', express.json(), [
+  body('id').optional().isInt().withMessage('Invalid user ID')
+], (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
+  // Extraire l'ID du body JSON
+  const userId = req.body.id;
+
+  if (!userId) {
+    return res.status(400).json({ error: 'User ID required' });
   }
 
   db.get(
@@ -120,29 +155,45 @@ app.get('/user/:id', (req, res) => {
       if (!row) {
         return res.status(404).json({ error: 'User not found' });
       }
-      res.json(row);
+      // Retourner dans un tableau pour compatibilité
+      res.json([row]);
     }
   );
 });
 
-// Route sécurisée pour les commentaires
-app.post('/comment', [
-  body('content')
-    .trim()
-    .notEmpty().withMessage('Content is required')
-    .isLength({ max: 500 }).withMessage('Content too long')
-    .escape() // Protection XSS
-], (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ errors: errors.array() });
+// Ajouter un commentaire (compatible avec text/plain et JSON)
+app.post('/comment', (req, res) => {
+  let content;
+  
+  // Supporter à la fois text/plain et application/json
+  if (typeof req.body === 'string') {
+    content = req.body.trim();
+  } else if (req.body && req.body.content) {
+    content = req.body.content.trim();
+  } else {
+    return res.status(400).json({ error: 'Content is required' });
   }
 
-  const { content } = req.body;
-  
+  // Validation
+  if (!content || content.length === 0) {
+    return res.status(400).json({ error: 'Content is required' });
+  }
+
+  if (content.length > 500) {
+    return res.status(400).json({ error: 'Content too long (max 500 characters)' });
+  }
+
+  // Échapper les caractères HTML pour prévenir XSS
+  const sanitizedContent = content
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+
   db.run(
     'INSERT INTO comments (content) VALUES (?)',
-    [content],
+    [sanitizedContent],
     function(err) {
       if (err) {
         console.error('Insert error:', err.message);
@@ -153,6 +204,7 @@ app.post('/comment', [
   );
 });
 
+// Lister les commentaires
 app.get('/comments', (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
   const offset = parseInt(req.query.offset) || 0;
@@ -168,6 +220,16 @@ app.get('/comments', (req, res) => {
       res.json(rows);
     }
   );
+});
+
+// Route de santé
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// Gestion des erreurs 404
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
 });
 
 // Gestion des erreurs globale
